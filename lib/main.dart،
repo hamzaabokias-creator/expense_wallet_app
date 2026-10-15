@@ -1,0 +1,534 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:intl/intl.dart' as intl;
+
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+    FlutterLocalNotificationsPlugin();
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  const AndroidInitializationSettings initializationSettingsAndroid =
+      AndroidInitializationSettings('@mipmap/ic_launcher');
+  const InitializationSettings initializationSettings =
+      InitializationSettings(android: initializationSettingsAndroid);
+  await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+
+  runApp(const ExpenseApp());
+}
+
+class ExpenseApp extends StatelessWidget {
+  const ExpenseApp({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'محفظتي',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blueGrey,
+          brightness: Brightness.dark,
+        ),
+      ),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+class TransactionItem {
+  final String id;
+  final String title;
+  final double amount;
+  final DateTime date;
+  final bool isExpense;
+  final String category;
+  final bool isRefundable;
+  final DateTime? dueDate;
+  bool isRefunded;
+
+  TransactionItem({
+    required this.id,
+    required this.title,
+    required this.amount,
+    required this.date,
+    required this.isExpense,
+    required this.category,
+    this.isRefundable = false,
+    this.dueDate,
+    this.isRefunded = false,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'amount': amount,
+        'date': date.toIso8601String(),
+        'isExpense': isExpense,
+        'category': category,
+        'isRefundable': isRefundable,
+        'dueDate': dueDate?.toIso8601String(),
+        'isRefunded': isRefunded,
+      };
+
+  factory TransactionItem.fromJson(Map<String, dynamic> json) => TransactionItem(
+        id: json['id'],
+        title: json['title'],
+        amount: json['amount'],
+        date: DateTime.parse(json['date']),
+        isExpense: json['isExpense'],
+        category: json['category'] ?? 'أخرى',
+        isRefundable: json['isRefundable'] ?? false,
+        dueDate: json['dueDate'] != null ? DateTime.parse(json['dueDate']) : null,
+        isRefunded: json['isRefunded'] ?? false,
+      );
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({Key? key}) : super(key: key);
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  double initialBudget = 0.0;
+  double walletBalance = 0.0;
+  List<TransactionItem> transactions = [];
+  final List<String> quickOptions = ['جودي', 'الأهل', 'اختي'];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadData();
+  }
+
+  Future<void> _loadData() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      initialBudget = prefs.getDouble('initialBudget') ?? 0.0;
+      walletBalance = prefs.getDouble('walletBalance') ?? 0.0;
+      String? txsString = prefs.getString('transactions');
+      if (txsString != null) {
+        List decoded = jsonDecode(txsString);
+        transactions = decoded.map((e) => TransactionItem.fromJson(e)).toList();
+      }
+    });
+  }
+
+  Future<void> _saveData() async {
+    final prefs = await SharedPreferences.getInstance();
+    prefs.setDouble('initialBudget', initialBudget);
+    prefs.setDouble('walletBalance', walletBalance);
+    prefs.setString('transactions', jsonEncode(transactions.map((e) => e.toJson()).toList()));
+  }
+
+  double getTodayExpenses() {
+    final now = DateTime.now();
+    return transactions
+        .where((t) =>
+            t.isExpense &&
+            t.date.year == now.year &&
+            t.date.month == now.month &&
+            t.date.day == now.day)
+        .fold(0.0, (sum, item) => sum + item.amount);
+  }
+
+  double getMonthExpenses() {
+    final now = DateTime.now();
+    return transactions
+        .where((t) =>
+            t.isExpense &&
+            t.date.year == now.year &&
+            t.date.month == now.month)
+        .fold(0.0, (sum, item) => sum + item.amount);
+  }
+
+  void _addDailyExpense(String title, double amount) {
+    setState(() {
+      transactions.insert(
+        0,
+        TransactionItem(
+          id: DateTime.now().toIso8601String(),
+          title: title,
+          amount: amount,
+          date: DateTime.now(),
+          isExpense: true,
+          category: 'مصروف يومي',
+        ),
+      );
+    });
+    _saveData();
+  }
+
+  void _handleWalletTransaction({
+    required bool isDeposit,
+    required double amount,
+    required String reason,
+    bool isRefundable = false,
+    DateTime? dueDate,
+  }) {
+    setState(() {
+      if (isDeposit) {
+        walletBalance += amount;
+      } else {
+        walletBalance -= amount;
+      }
+
+      transactions.insert(
+        0,
+        TransactionItem(
+          id: DateTime.now().toIso8601String(),
+          title: isDeposit ? 'إيداع بالمحفظة: $reason' : 'سحب من المحفظة: $reason',
+          amount: amount,
+          date: DateTime.now(),
+          isExpense: !isDeposit,
+          category: reason,
+          isRefundable: isRefundable,
+          dueDate: dueDate,
+        ),
+      );
+    });
+    _saveData();
+
+    if (isRefundable && dueDate != null) {
+      _scheduleNotification(dueDate, reason);
+    }
+  }
+
+  Future<void> _scheduleNotification(DateTime dueDate, String reason) async {
+    const AndroidNotificationDetails androidPlatformChannelSpecifics =
+        AndroidNotificationDetails(
+      'debt_channel',
+      'تذكير الديون',
+      channelDescription: 'تذكير بالاموال المستردة',
+      importance: Importance.max,
+      priority: Priority.high,
+    );
+    const NotificationDetails platformChannelSpecifics =
+        NotificationDetails(android: androidPlatformChannelSpecifics);
+
+    int notificationId = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    await flutterLocalNotificationsPlugin.schedule(
+      notificationId,
+      'استرداد أموال',
+      'حكاية استرداد المبلغ الخاص بـ ($reason) حان موعدها أو اقترب.',
+      dueDate,
+      platformChannelSpecifics,
+      androidAllowWhileIdle: true,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
+    );
+  }
+
+  void _showAddExpenseDialog() {
+    final titleController = TextEditingController();
+    final amountController = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('إضافة مصروف يومي'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: titleController,
+              decoration: const InputDecoration(labelText: 'سبب أو اسم المصروف'),
+            ),
+            TextField(
+              controller: amountController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'المبلغ'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('إلغاء'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              if (titleController.text.isNotEmpty && amountController.text.isNotEmpty) {
+                double? amt = double.tryParse(amountController.text);
+                if (amt != null) {
+                  _addDailyExpense(titleController.text, amt);
+                  Navigator.pop(context);
+                }
+              }
+            },
+            child: const Text('إضافة'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showWalletDialog(bool isDeposit) {
+    final amountController = TextEditingController();
+    String selectedCategory = quickOptions[0];
+    bool isRefundable = false;
+    DateTime? selectedDate = DateTime.now().add(const Duration(days: 7));
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(isDeposit ? 'إيداع في المحفظة' : 'سحب من المحفظة'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: amountController,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'المبلغ'),
+                ),
+                const SizedBox(height: 16),
+                Text(isDeposit ? 'من أين أضيفت؟' : 'لماذا سحبت؟'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  children: quickOptions.map((opt) {
+                    return ChoiceChip(
+                      label: Text(opt),
+                      selected: selectedCategory == opt,
+                      onSelected: (selected) {
+                        setDialogState(() {
+                          selectedCategory = opt;
+                        });
+                      },
+                    );
+                  }).toList(),
+                ),
+                if (!isDeposit) ...[
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Checkbox(
+                        value: isRefundable,
+                        onChanged: (val) {
+                          setDialogState(() {
+                            isRefundable = val ?? false;
+                          });
+                        },
+                      ),
+                      const Text('اموال مستردة (دين)؟'),
+                    ],
+                  ),
+                  if (isRefundable)
+                    TextButton(
+                      onPressed: () async {
+                        DateTime? picked = await showDatePicker(
+                          context: context,
+                          initialDate: selectedDate ?? DateTime.now(),
+                          firstDate: DateTime.now(),
+                          lastDate: DateTime(2100),
+                        );
+                        if (picked != null) {
+                          setDialogState(() {
+                            selectedDate = picked;
+                          });
+                        }
+                      },
+                      child: Text('موعد الاسترداد: ${intl.DateFormat('yyyy-MM-dd').format(selectedDate!)}'),
+                    ),
+                ]
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                double? amt = double.tryParse(amountController.text);
+                if (amt != null) {
+                  _handleWalletTransaction(
+                    isDeposit: isDeposit,
+                    amount: amt,
+                    reason: selectedCategory,
+                    isRefundable: isRefundable,
+                    dueDate: isRefundable ? selectedDate : null,
+                  );
+                  Navigator.pop(context);
+                }
+              },
+              child: const Text('تنفيذ'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('إدارة المصاريف والمحفظة'),
+      ),
+      drawer: Drawer(
+        child: ListView(
+          padding: EdgeInsets.zero,
+          children: [
+            DrawerHeader(
+              decoration: BoxDecoration(color: Theme.of(context).colorScheme.primaryContainer),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  const Text('المحفظة (المدخرات)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Text('${walletBalance.toStringAsFixed(2)} ل.س', style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.add_circle_outline, color: Colors.green),
+              title: const Text('إيداع بالمحفظة'),
+              onTap: () {
+                Navigator.pop(context);
+                _showWalletDialog(true);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.remove_circle_outline, color: Colors.red),
+              title: const Text('سحب من المحفظة'),
+              onTap: () {
+                Navigator.pop(context);
+                _showWalletDialog(false);
+              },
+            ),
+            const Divider(),
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: TextField(
+                decoration: const InputDecoration(labelText: 'تحديد المبلغ الأساسي المتاح'),
+                keyboardType: TextInputType.number,
+                onSubmitted: (val) {
+                  double? b = double.tryParse(val);
+                  if (b != null) {
+                    setState(() {
+                      initialBudget = b;
+                    });
+                    _saveData();
+                  }
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('صرف اليوم', style: TextStyle(color: Colors.grey)),
+                          const SizedBox(height: 8),
+                          Text('${getTodayExpenses().toStringAsFixed(2)}', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('صرف الشهر', style: TextStyle(color: Colors.grey)),
+                          const SizedBox(height: 8),
+                          Text('${getMonthExpenses().toStringAsFixed(2)}', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            const Align(
+              alignment: Alignment.centerRight,
+              child: Text('العمليات الأخيرة', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: transactions.isEmpty
+                  ? const Center(child: Text('لا توجد عمليات مسجلة'))
+                  : ListView.builder(
+                      itemCount: transactions.length,
+                      itemBuilder: (context, index) {
+                        final tx = transactions[index];
+                        return Card(
+                          margin: const EdgeInsets.symmetric(vertical: 4),
+                          child: ListTile(
+                            title: Text(tx.title),
+                            subtitle: Text('${intl.DateFormat('yyyy-MM-dd HH:mm').format(tx.date)} | الفئة: ${tx.category}'),
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  '${tx.isExpense ? '-' : '+'}${tx.amount.toStringAsFixed(2)}',
+                                  style: TextStyle(
+                                    color: tx.isExpense ? Colors.redAccent : Colors.greenAccent,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                if (tx.isRefundable) ...[
+                                  const SizedBox(width: 8),
+                                  IconButton(
+                                    icon: Icon(
+                                      tx.isRefunded ? Icons.check_box : Icons.check_box_outline_blank,
+                                      color: tx.isRefunded ? Colors.green : Colors.orange,
+                                    ),
+                                    onPressed: () {
+                                      setState(() {
+                                        tx.isRefunded = !tx.isRefunded;
+                                        if (tx.isRefunded) {
+                                          walletBalance += tx.amount;
+                                        } else {
+                                          walletBalance -= tx.amount;
+                                        }
+                                      });
+                                      _saveData();
+                                    },
+                                    tooltip: 'تحديد هل تم استرداد المبلغ أم لا',
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _showAddExpenseDialog,
+        child: const Icon(Icons.add),
+        tooltip: 'إضافة مصروف',
+      ),
+    );
+  }
+}
