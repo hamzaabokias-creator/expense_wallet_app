@@ -1,4 +1,4 @@
-name: Build APK
+name: Build APK Clean
 
 on:
   push:
@@ -21,16 +21,21 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.19.0'
+          channel: 'stable'
 
-      - name: Get Dependencies
-        run: flutter pub get
-
-      - name: Build APK
-        run: flutter build apk --release
+      - name: Build Clean Project
+        run: |
+          flutter create temp_app --org com.example.expenseapp
+          rm -rf temp_app/lib/*
+          cp -r lib/* temp_app/lib/
+          cp pubspec.yaml temp_app/pubspec.yaml
+          cd temp_app
+          flutter pub get
+          flutter build apk --release
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: temp_app/build/app/outputs/flutter-apk/app-release.apk
           
